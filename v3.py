@@ -178,80 +178,66 @@ def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
 
     # 逐个 region 做处理
     for i_reg_idx in range(4):
-        # 1) 读入 _Zvb{i_reg+1}.csv
+        # 读取 _Zvb 文件并过滤包含 NA 的行
         path_vb = os.path.join(log_folder, f"_Zvb{i_reg_idx+1}.csv")
         df_vb = pd.read_csv(path_vb)
-        arr_vb = df_vb.to_numpy(dtype=float)  # shape: (n_t-lag_month, n_sec), 但中间含 NA
+        arr_vb = df_vb.to_numpy(dtype=float)
 
-        # 找 NA 行 => R 中 i.ex
+        # 使用布尔索引过滤不含 NA 的行
         mask_na_row = np.any(np.isnan(arr_vb), axis=1)
-        i_ex = np.where(mask_na_row)[0]
+        arr_vb_clean = arr_vb[~mask_na_row, :]
 
-        # 2) 读入 _Za{i_reg+1}.csv
+        # 读取 _Za 文件
         path_a = os.path.join(log_folder, f"_Za{i_reg_idx+1}.csv")
         df_a = pd.read_csv(path_a)
-        arr_a = df_a.to_numpy(dtype=float)  # shape: (n_issue_region, n_t-lag_month)
+        arr_a = df_a.to_numpy(dtype=float)
 
-        # 如果 i_ex 不空, 需要把 arr_a 中对应的列删除 => Python 中 axis=1
-        # R 里: a<-a[,-i.ex]
-        if len(i_ex)>0:
-            arr_vb_clean = np.delete(arr_vb, i_ex, axis=0)  # shape: (some_row, n_sec)
-            arr_a_clean  = np.delete(arr_a, i_ex, axis=1)  # shape: (n_issue_region, some_row)
+        # 如果存在 NA 行，则从 arr_a 删除对应列
+        if np.any(mask_na_row):
+            arr_a_clean = arr_a[:, ~mask_na_row]  # 保留未被过滤的列
         else:
-            arr_vb_clean = arr_vb
-            arr_a_clean  = arr_a
+            arr_a_clean = arr_a
 
-        # region 的 issue 索引
         reg_inds = i_regs[i_reg_idx]
-
         n_issues_region = arr_a_clean.shape[0]
-        for i_issue_local in range(n_issues_region):
-            x = arr_a_clean[i_issue_local, :]  # shape: (some_row,)
-            ii = reg_inds[i_issue_local]       # 在 a0 中的行号
 
-            # 只保留非NA
+        for i_issue_local in range(n_issues_region):
+            x = arr_a_clean[i_issue_local, :]
+            ii = reg_inds[i_issue_local]
+
             valid_mask = ~np.isnan(x)
-            if np.sum(valid_mask)>10:
-                X_fac = arr_vb_clean[valid_mask,:]  # shape: (k, n_sec)
+            if np.sum(valid_mask) > 10:
+                X_fac = arr_vb_clean[valid_mask, :]
                 y = x[valid_mask]
 
-                # 回归 y ~ X_fac
-                # => y = c0 + c1*F1 + ...
                 X_design = np.column_stack((np.ones(X_fac.shape[0]), X_fac))
                 coefs, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
-                # coefs[0] = intercept, coefs[1..n_sec] = factor loadings
 
-                # 回归统计
                 y_hat = X_design @ coefs
                 resid = y - y_hat
                 ss_res = np.sum(resid**2)
-                ss_tot = np.sum((y-np.mean(y))**2)
-                r2 = 1-ss_res/ss_tot if ss_tot!=0 else np.nan
-                df_reg = X_fac.shape[1]  # n_sec
+                ss_tot = np.sum((y - np.mean(y))**2)
+                r2 = 1 - ss_res/ss_tot if ss_tot != 0 else np.nan
+
                 n_obs = X_fac.shape[0]
-                if n_obs - df_reg - 1>0:
-                    adj_r2 = 1-(1-r2)*(n_obs-1)/(n_obs-df_reg-1)
+                df_reg = X_fac.shape[1]
+                if n_obs - df_reg - 1 > 0:
+                    adj_r2 = 1 - (1 - r2)*(n_obs - 1)/(n_obs - df_reg - 1)
                 else:
                     adj_r2 = np.nan
 
-                # 缩放因子 (原R里 Fi$Q*... => beta.SF = apply(vb[k,],2, sqrt(sum(x*x))) ...
                 factor_norm = np.sqrt(np.sum(X_fac**2, axis=0))
                 x_sd = np.std(y, ddof=1)
-                denom = x_sd*np.sqrt(np.sum(valid_mask)-1)
-                if denom!=0:
-                    beta_sf = factor_norm/denom
-                else:
-                    beta_sf = np.zeros(n_sec)
+                denom = x_sd * np.sqrt(np.sum(valid_mask) - 1)
+                beta_sf = factor_norm/denom if denom != 0 else np.zeros(n_sec)
 
-                b_original = coefs[1:]  # coefs[1..]
-                b_scaled   = b_original*beta_sf
+                b_scaled = coefs[1:] * beta_sf
 
-                # 写入 betas
-                betas[ii, :n_sec]    = b_scaled
-                betas[ii, n_sec]     = coefs[0]     # intercept
-                betas[ii, n_sec+1]   = np.sum(valid_mask) # n.issue
-                betas[ii, n_sec+2]   = r2
-                betas[ii, n_sec+3]   = adj_r2
+                betas[ii, :n_sec]   = b_scaled
+                betas[ii, n_sec]    = coefs[0]
+                betas[ii, n_sec+1]  = np.sum(valid_mask)
+                betas[ii, n_sec+2]  = r2
+                betas[ii, n_sec+3]  = adj_r2
 
     # 给 betas 加列名 => b0..b5, intercept, n.issue, R-sq, adj.R-sq
     col_betas = [f"b{k}" for k in range(n_sec)] + ["intercept","n.issue","R-sq","adj.R-sq"]
@@ -364,18 +350,23 @@ def main():
     [2, 4],
     [3, 5],
     [6, 7]
-]
+    ]
     i_regs = [np.where(a0['Region'].isin(grp))[0] for grp in region_groups]
 
     n_sec = 6
-    n_t = a0_ts.shape[1]
-    idx0 = np.zeros(n_t, dtype=float)
-    n_iss_idx0 = np.zeros(n_t, dtype=int)
-    for i in range(n_t):
-        col_data = a0_ts.iloc[:, i]
-        idx0[i] = np.nanmean(col_data)
-        n_iss_idx0[i] = col_data.notna().sum()
+    # n_t = a0_ts.shape[1]
+    # idx0 = np.zeros(n_t, dtype=float)
+    # n_iss_idx0 = np.zeros(n_t, dtype=int)
+    # for i in range(n_t):
+    #     col_data = a0_ts.iloc[:, i]
+    #     idx0[i] = np.nanmean(col_data)
+    #     n_iss_idx0[i] = col_data.notna().sum()
 
+    # 计算每列的非空平均值，返回一个 Series，再转为 numpy 数组
+    idx0 = a0_ts.mean(axis=0, skipna=True).values
+    # 计算每列非空值的个数，返回一个 Series，再转为整型 numpy 数组
+    n_iss_idx0 = a0_ts.notna().sum(axis=0).values.astype(int)
+    
     os.makedirs("log", exist_ok=True)
     os.makedirs("result", exist_ok=True)
 
