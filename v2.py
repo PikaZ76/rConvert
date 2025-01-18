@@ -329,72 +329,71 @@ def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
     sector_col = "Sector"
     rating_col = "Rating"
 
-    # 使用 output 和 good.rho 过滤后的 DataFrame
-    df_good = output[output["good.rho"]==True].copy()
+    unique_regions = [0, 1, 2, 3, 4]
+    unique_sectors = range(0, 6)
+    unique_ratings = range(0, 8)
 
-    # 分桶统计：计算平均值和标准差
     avg_rows = []
-    sd_rows  = []
-    unique_regions = [0,1,2,3,4]
-    unique_sectors = range(0,6)
-    unique_ratings = range(0,8)
+    sd_rows = []
+
+    df_good = output.copy()  # 未过滤的完整数据
 
     for i_reg in unique_regions:
-        if i_reg==0:
+        if i_reg == 0:
             output1 = df_good
         else:
-            output1 = df_good[df_good[region_col]==i_reg]
+            output1 = df_good[df_good[region_col] == i_reg]
 
         for i_sec in unique_sectors:
             for i_rat in unique_ratings:
-                sub_df = output1
-                if i_sec>0:
-                    sub_df = sub_df[sub_df[sector_col]==i_sec]
-                if i_rat>0:
-                    sub_df = sub_df[sub_df[rating_col]==i_rat]
-                count_i = len(sub_df)
-                if count_i>0:
-                    bmat = sub_df[b_cols].to_numpy()
-                    mean_ = np.round(np.nanmean(bmat, axis=0),4)
-                    std_  = np.round(np.nanstd(bmat, axis=0, ddof=1),4)
+                cond = (output1["good.rho"] == True)
+                if i_sec > 0:
+                    cond &= (output1[sector_col] == i_sec)
+                if i_rat > 0:
+                    cond &= (output1[rating_col] == i_rat)
+                sel_df = output1[cond]
+
+                count_i = len(sel_df)
+                if count_i > 0:
+                    bmat = sel_df[b_cols].to_numpy()
+                    mean_ = np.round(np.nanmean(bmat, axis=0), 4)
+                    std_ = np.round(np.nanstd(bmat, axis=0, ddof=1), 4)
                 else:
-                    mean_ = [np.nan]*n_sec
-                    std_  = [np.nan]*n_sec
+                    mean_ = [np.nan] * n_sec
+                    std_ = [np.nan] * n_sec
 
-                avg_rows.append([i_reg, i_sec, i_rat, count_i]+list(mean_))
-                sd_rows.append([i_reg, i_sec, i_rat, count_i]+list(std_))
+                avg_rows.append([i_reg, i_sec, i_rat, count_i] + list(mean_))
+                sd_rows.append([i_reg, i_sec, i_rat, count_i] + list(std_))
 
-    col_names = ["Region","Sector","Rating","Count"]+[f"b{k}" for k in range(n_sec)]
+    col_names = ["Region", "Sector", "Rating", "Count"] + [f"b{k}" for k in range(n_sec)]
     df_avg = pd.DataFrame(avg_rows, columns=col_names)
-    df_sd  = pd.DataFrame(sd_rows,  columns=col_names)
+    df_sd = pd.DataFrame(sd_rows, columns=col_names)
 
-    # 空桶填补逻辑，与 R 中 empty.buckets 部分一致
     empty_buckets = df_avg[df_avg["Count"] < 5].index
     for k in empty_buckets:
         R_ = df_avg.at[k, "Region"]
         S_ = df_avg.at[k, "Sector"]
-        # 按 R 逻辑依次尝试填补
-        cond1 = (df_avg["Region"]==R_) & (df_avg["Sector"]==S_) & (df_avg["Rating"]==0) & (df_avg["Count"]>=5)
+
+        cond1 = (df_avg["Region"] == R_) & (df_avg["Sector"] == S_) & (df_avg["Rating"] == 0) & (df_avg["Count"] >= 5)
         c1 = df_avg[cond1]
         if not c1.empty:
             df_avg.loc[k, b_cols] = c1.iloc[0][b_cols]
-            df_sd.loc[k, b_cols]  = c1.iloc[0][b_cols]
+            df_sd.loc[k, b_cols] = c1.iloc[0][b_cols]
         else:
-            cond2 = (df_avg["Region"]==R_) & (df_avg["Sector"]==0) & (df_avg["Rating"]==0) & (df_avg["Count"]>=5)
+            cond2 = (df_avg["Region"] == R_) & (df_avg["Sector"] == 0) & (df_avg["Rating"] == 0) & (df_avg["Count"] >= 5)
             c2 = df_avg[cond2]
             if not c2.empty:
                 df_avg.loc[k, b_cols] = c2.iloc[0][b_cols]
-                df_sd.loc[k, b_cols]  = c2.iloc[0][b_cols]
+                df_sd.loc[k, b_cols] = c2.iloc[0][b_cols]
             else:
-                cond3 = (df_avg["Region"]==0) & (df_avg["Sector"]==0) & (df_avg["Rating"]==0) & (df_avg["Count"]>=5)
+                cond3 = (df_avg["Region"] == 0) & (df_avg["Sector"] == 0) & (df_avg["Rating"] == 0) & (df_avg["Count"] >= 5)
                 c3 = df_avg[cond3]
                 if not c3.empty:
                     df_avg.loc[k, b_cols] = c3.iloc[0][b_cols]
-                    df_sd.loc[k, b_cols]  = c3.iloc[0][b_cols]
+                    df_sd.loc[k, b_cols] = c3.iloc[0][b_cols]
 
-    # 写出平均值和标准差结果文件
     fn_avg = os.path.join(result_folder, f"betas_mean_lag_{lag_month}.csv")
-    fn_sd  = os.path.join(result_folder, f"betas_sd_lag_{lag_month}.csv")
+    fn_sd = os.path.join(result_folder, f"betas_sd_lag_{lag_month}.csv")
     df_avg.to_csv(fn_avg, index=False)
     df_sd.to_csv(fn_sd, index=False)
 
