@@ -210,6 +210,221 @@ def get_Za(a0_ts, a0_anno, i_regs, lag_month=12, out_folder="log"):
         df_a = pd.DataFrame(a_dn)
         df_a.to_csv(os.path.join(out_folder, f"_Za{i_reg_idx+1}.csv"), index=False)
 
+
+
+def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
+                           log_folder="log", result_folder="result"):
+    """
+    将原 R 脚本末尾的回归 & 聚合逻辑封装在这里:
+      1) 读取每个 region 的 _Zvb{i_reg+1}.csv + _Za{i_reg+1}.csv + _ZidxB{i_reg+1}.csv
+      2) 对 NA 行/列做相同处理 => 回归 => betas 矩阵
+      3) 与 a0_anno 合并 => 写 betas_all_lag_{lag_month}.csv
+      4) 分(Region, Sector, Rating)分桶计算 => 写 betas_mean_lag_{lag_month}.csv, betas_sd_lag_{lag_month}.csv
+    """
+    os.makedirs(result_folder, exist_ok=True)
+
+    # 最终要存放回归系数的矩阵 [n_issues, n_sec + 4]
+    # (b0..b5, intercept, n.issue, R-sq, adj.R-sq)
+    betas = np.full((a0.shape[0], n_sec+4), np.nan, dtype=float)
+
+    # 逐个 region 做处理
+    for i_reg_idx in range(4):
+        # 1) 读入 _Zvb{i_reg+1}.csv
+        path_vb = os.path.join(log_folder, f"_Zvb{i_reg_idx+1}.csv")
+        df_vb = pd.read_csv(path_vb)
+        arr_vb = df_vb.to_numpy(dtype=float)  # shape: (n_t-lag_month, n_sec), 但中间含 NA
+
+        # 找 NA 行 => R 中 i.ex
+        mask_na_row = np.any(np.isnan(arr_vb), axis=1)
+        i_ex = np.where(mask_na_row)[0]
+
+        # 2) 读入 _Za{i_reg+1}.csv
+        path_a = os.path.join(log_folder, f"_Za{i_reg_idx+1}.csv")
+        df_a = pd.read_csv(path_a)
+        arr_a = df_a.to_numpy(dtype=float)  # shape: (n_issue_region, n_t-lag_month)
+
+        # 如果 i_ex 不空, 需要把 arr_a 中对应的列删除 => Python 中 axis=1
+        # R 里: a<-a[,-i.ex]
+        if len(i_ex)>0:
+            arr_vb_clean = np.delete(arr_vb, i_ex, axis=0)  # shape: (some_row, n_sec)
+            arr_a_clean  = np.delete(arr_a, i_ex, axis=1)  # shape: (n_issue_region, some_row)
+        else:
+            arr_vb_clean = arr_vb
+            arr_a_clean  = arr_a
+
+        # region 的 issue 索引
+        reg_inds = i_regs[i_reg_idx]
+
+        n_issues_region = arr_a_clean.shape[0]
+        for i_issue_local in range(n_issues_region):
+            x = arr_a_clean[i_issue_local, :]  # shape: (some_row,)
+            ii = reg_inds[i_issue_local]       # 在 a0 中的行号
+
+            # 只保留非NA
+            valid_mask = ~np.isnan(x)
+            if np.sum(valid_mask)>10:
+                X_fac = arr_vb_clean[valid_mask,:]  # shape: (k, n_sec)
+                y = x[valid_mask]
+
+                # 回归 y ~ X_fac
+                # => y = c0 + c1*F1 + ...
+                X_design = np.column_stack((np.ones(X_fac.shape[0]), X_fac))
+                coefs, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
+                # coefs[0] = intercept, coefs[1..n_sec] = factor loadings
+
+                # 回归统计
+                y_hat = X_design @ coefs
+                resid = y - y_hat
+                ss_res = np.sum(resid**2)
+                ss_tot = np.sum((y-np.mean(y))**2)
+                r2 = 1-ss_res/ss_tot if ss_tot!=0 else np.nan
+                df_reg = X_fac.shape[1]  # n_sec
+                n_obs = X_fac.shape[0]
+                if n_obs - df_reg - 1>0:
+                    adj_r2 = 1-(1-r2)*(n_obs-1)/(n_obs-df_reg-1)
+                else:
+                    adj_r2 = np.nan
+
+                # 缩放因子 (原R里 Fi$Q*... => beta.SF = apply(vb[k,],2, sqrt(sum(x*x))) ...
+                factor_norm = np.sqrt(np.sum(X_fac**2, axis=0))
+                x_sd = np.std(y, ddof=1)
+                denom = x_sd*np.sqrt(np.sum(valid_mask)-1)
+                if denom!=0:
+                    beta_sf = factor_norm/denom
+                else:
+                    beta_sf = np.zeros(n_sec)
+
+                b_original = coefs[1:]  # coefs[1..]
+                b_scaled   = b_original*beta_sf
+
+                # 写入 betas
+                betas[ii, :n_sec]    = b_scaled
+                betas[ii, n_sec]     = coefs[0]     # intercept
+                betas[ii, n_sec+1]   = np.sum(valid_mask) # n.issue
+                betas[ii, n_sec+2]   = r2
+                betas[ii, n_sec+3]   = adj_r2
+
+    # 给 betas 加列名 => b0..b5, intercept, n.issue, R-sq, adj.R-sq
+    col_betas = [f"b{k}" for k in range(n_sec)] + ["intercept","n.issue","R-sq","adj.R-sq"]
+    df_betas = pd.DataFrame(betas, columns=col_betas)
+
+    # 计算 rho = sum of b0^2..b5^2
+    b_sqr = np.sum(df_betas.iloc[:, :n_sec].values**2, axis=1)
+    df_betas["rho"] = b_sqr
+    good_rho_mask = (~np.isnan(b_sqr)) & (b_sqr <=1)
+    df_betas["good.rho"] = good_rho_mask
+
+    # 合并注释
+    output = pd.concat([a0_anno.reset_index(drop=True), df_betas], axis=1)
+    # 写 betas_all
+    fn_all = os.path.join(result_folder, f"betas_all_lag_{lag_month}.csv")
+    output.to_csv(fn_all, index=False)
+
+    # 分桶统计 => region, sector, rating => 计算平均/标准差
+    # 假设 a0_anno 的列 3=Region, 4=Sector, 5=Rating(自行核对)
+    region_col = "Region"
+    sector_col = "Sector"
+    rating_col = "Rating"
+
+    # 计算 pairwise correlation 不一定必须，这里略
+
+    # 构造 avg, sd
+    # b0..b5 => output.columns 的位置: a0_anno有n_anno=5列 => betas从第5列起. 
+    # 具体需核对, 这里相当于 b0..b5 => output.iloc[:, 5:11]
+    # intercept=col11, ...
+    b_cols = [f"b{k}" for k in range(n_sec]]  # =>  b0..b5
+    # 根据 good.rho==True 过滤
+    df_good = output[output["good.rho"]==True].copy()
+
+    # 构建(Region=0~4, Sector=0..5, Rating=0..7) => 并检查 count
+    # 与 R 里的 for(i.reg in 0:4) ... 类似
+    # 这里 0 代表全局 => output1=output
+    # region=1..4 => output1=特定region
+
+    # 先准备空list
+    avg_rows = []
+    sd_rows  = []
+
+    # 给 region 的取值: 0 表示“全局” => R 里 i.reg=0 => output
+    unique_regions = [0,1,2,3,4]
+    unique_sectors = range(0,6)
+    unique_ratings = range(0,8)
+
+    # region=0 => 全 output
+    # region>0 => subset
+    for i_reg in unique_regions:
+        if i_reg==0:
+            output1 = df_good
+        else:
+            output1 = df_good[df_good[region_col]==i_reg]
+
+        for i_sec in unique_sectors:
+            for i_rat in unique_ratings:
+                # subset
+                sub_df = output1
+                if i_sec>0:
+                    sub_df = sub_df[sub_df[sector_col]==i_sec]
+                if i_rat>0:
+                    sub_df = sub_df[sub_df[rating_col]==i_rat]
+                count_i = len(sub_df)
+                if count_i>0:
+                    # b_cols => b0..b5
+                    bmat = sub_df[b_cols].to_numpy()
+                    mean_ = np.nanmean(bmat, axis=0)
+                    std_  = np.nanstd(bmat, axis=0, ddof=1)
+                else:
+                    mean_ = [np.nan]*n_sec
+                    std_  = [np.nan]*n_sec
+
+                avg_rows.append([i_reg, i_sec, i_rat, count_i]+list(mean_))
+                sd_rows.append([i_reg, i_sec, i_rat, count_i]+list(std_))
+
+    # 构造 DataFrame
+    col_names = ["Region","Sector","Rating","Count"]+[f"b{k}" for k in range(n_sec)]
+    df_avg = pd.DataFrame(avg_rows, columns=col_names)
+    df_sd  = pd.DataFrame(sd_rows,  columns=col_names)
+
+    # 补空桶 => 如果 count<5, 回退 region/s0/r0 => 详见 R 逻辑
+    # 这里只简单演示
+    def fill_bucket(k, df_main):
+        # region=R, sector=S, rating=T
+        R_ = df_main.at[k,"Region"]
+        S_ = df_main.at[k,"Sector"]
+        T_ = df_main.at[k,"Rating"]
+        # 先 region=R_, sector=S_, rating=0
+        cond1 = (df_main["Region"]==R_)&(df_main["Sector"]==S_)&(df_main["Rating"]==0)&(df_main["Count"]>=5)
+        c1 = df_main[cond1]
+        if len(c1)>0:
+            return c1.iloc[0, 4:].values  # b0..b5
+        # region=R_, sector=0, rating=0
+        cond2 = (df_main["Region"]==R_)&(df_main["Sector"]==0)&(df_main["Rating"]==0)&(df_main["Count"]>=5)
+        c2 = df_main[cond2]
+        if len(c2)>0:
+            return c2.iloc[0,4:].values
+        # region=0, sector=0, rating=0
+        cond3 = (df_main["Region"]==0)&(df_main["Sector"]==0)&(df_main["Rating"]==0)&(df_main["Count"]>=5)
+        c3 = df_main[cond3]
+        if len(c3)>0:
+            return c3.iloc[0,4:].values
+        return None
+
+    def bucket_fill_inplace(df_main):
+        for i in range(len(df_main)):
+            if df_main.at[i,"Count"]<5:
+                newvals = fill_bucket(i, df_main)
+                if newvals is not None:
+                    df_main.iloc[i, 4:] = newvals
+
+    bucket_fill_inplace(df_avg)
+    bucket_fill_inplace(df_sd)
+
+    # 写出
+    fn_avg = os.path.join(result_folder, f"betas_mean_lag_{lag_month}.csv")
+    fn_sd  = os.path.join(result_folder, f"betas_sd_lag_{lag_month}.csv")
+    df_avg.to_csv(fn_avg, index=False)
+    df_sd.to_csv(fn_sd, index=False)
+
+    print(f"[calc_betas_and_results] Done. Wrote:\n {fn_all}\n {fn_avg}\n {fn_sd}")
 ###############################################################################
 # 主函数: 演示如何调用上述4个函数
 ###############################################################################
@@ -254,6 +469,8 @@ def main():
     # 4) 对每个 region 的 issues 做差分, 导出 4 个 "_Za{i_reg+1}.csv"
     get_Za(a0_ts, a0_anno, i_regs, lag_month=12, out_folder="log")
 
+    calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
+                           log_folder="log", result_folder="result")
     print("All done. Check 'log' folder for _ZidxA1..4.csv, _ZidxB1..4.csv, _Zvb1..4.csv, _Za1..4.csv")
 
 if __name__=="__main__":
