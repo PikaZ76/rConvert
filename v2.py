@@ -211,9 +211,10 @@ def get_Za(a0_ts, a0_anno, i_regs, lag_month=12, out_folder="log"):
         df_a.to_csv(os.path.join(out_folder, f"_Za{i_reg_idx+1}.csv"), index=False)
 
 
-
 def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
                            log_folder="log", result_folder="result"):
+    os.makedirs(result_folder, exist_ok=True)
+
     """
     将原 R 脚本末尾的回归 & 聚合逻辑封装在这里:
       1) 读取每个 region 的 _Zvb{i_reg+1}.csv + _Za{i_reg+1}.csv + _ZidxB{i_reg+1}.csv
@@ -322,36 +323,22 @@ def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
 
     # 分桶统计 => region, sector, rating => 计算平均/标准差
     # 假设 a0_anno 的列 3=Region, 4=Sector, 5=Rating(自行核对)
+    # 计算 pairwise correlation 和分桶统计前的准备
+    b_cols = [f"b{k}" for k in range(n_sec)]
     region_col = "Region"
     sector_col = "Sector"
     rating_col = "Rating"
 
-    # 计算 pairwise correlation 不一定必须，这里略
-
-    # 构造 avg, sd
-    # b0..b5 => output.columns 的位置: a0_anno有n_anno=5列 => betas从第5列起. 
-    # 具体需核对, 这里相当于 b0..b5 => output.iloc[:, 5:11]
-    # intercept=col11, ...
-    b_cols = [f"b{k}" for k in range(n_sec]]  # =>  b0..b5
-    # 根据 good.rho==True 过滤
+    # 使用 output 和 good.rho 过滤后的 DataFrame
     df_good = output[output["good.rho"]==True].copy()
 
-    # 构建(Region=0~4, Sector=0..5, Rating=0..7) => 并检查 count
-    # 与 R 里的 for(i.reg in 0:4) ... 类似
-    # 这里 0 代表全局 => output1=output
-    # region=1..4 => output1=特定region
-
-    # 先准备空list
+    # 分桶统计：计算平均值和标准差
     avg_rows = []
     sd_rows  = []
-
-    # 给 region 的取值: 0 表示“全局” => R 里 i.reg=0 => output
     unique_regions = [0,1,2,3,4]
     unique_sectors = range(0,6)
     unique_ratings = range(0,8)
 
-    # region=0 => 全 output
-    # region>0 => subset
     for i_reg in unique_regions:
         if i_reg==0:
             output1 = df_good
@@ -360,7 +347,6 @@ def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
 
         for i_sec in unique_sectors:
             for i_rat in unique_ratings:
-                # subset
                 sub_df = output1
                 if i_sec>0:
                     sub_df = sub_df[sub_df[sector_col]==i_sec]
@@ -368,10 +354,9 @@ def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
                     sub_df = sub_df[sub_df[rating_col]==i_rat]
                 count_i = len(sub_df)
                 if count_i>0:
-                    # b_cols => b0..b5
                     bmat = sub_df[b_cols].to_numpy()
-                    mean_ = np.nanmean(bmat, axis=0)
-                    std_  = np.nanstd(bmat, axis=0, ddof=1)
+                    mean_ = np.round(np.nanmean(bmat, axis=0),4)
+                    std_  = np.round(np.nanstd(bmat, axis=0, ddof=1),4)
                 else:
                     mean_ = [np.nan]*n_sec
                     std_  = [np.nan]*n_sec
@@ -379,53 +364,42 @@ def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
                 avg_rows.append([i_reg, i_sec, i_rat, count_i]+list(mean_))
                 sd_rows.append([i_reg, i_sec, i_rat, count_i]+list(std_))
 
-    # 构造 DataFrame
     col_names = ["Region","Sector","Rating","Count"]+[f"b{k}" for k in range(n_sec)]
     df_avg = pd.DataFrame(avg_rows, columns=col_names)
     df_sd  = pd.DataFrame(sd_rows,  columns=col_names)
 
-    # 补空桶 => 如果 count<5, 回退 region/s0/r0 => 详见 R 逻辑
-    # 这里只简单演示
-    def fill_bucket(k, df_main):
-        # region=R, sector=S, rating=T
-        R_ = df_main.at[k,"Region"]
-        S_ = df_main.at[k,"Sector"]
-        T_ = df_main.at[k,"Rating"]
-        # 先 region=R_, sector=S_, rating=0
-        cond1 = (df_main["Region"]==R_)&(df_main["Sector"]==S_)&(df_main["Rating"]==0)&(df_main["Count"]>=5)
-        c1 = df_main[cond1]
-        if len(c1)>0:
-            return c1.iloc[0, 4:].values  # b0..b5
-        # region=R_, sector=0, rating=0
-        cond2 = (df_main["Region"]==R_)&(df_main["Sector"]==0)&(df_main["Rating"]==0)&(df_main["Count"]>=5)
-        c2 = df_main[cond2]
-        if len(c2)>0:
-            return c2.iloc[0,4:].values
-        # region=0, sector=0, rating=0
-        cond3 = (df_main["Region"]==0)&(df_main["Sector"]==0)&(df_main["Rating"]==0)&(df_main["Count"]>=5)
-        c3 = df_main[cond3]
-        if len(c3)>0:
-            return c3.iloc[0,4:].values
-        return None
+    # 空桶填补逻辑，与 R 中 empty.buckets 部分一致
+    empty_buckets = df_avg[df_avg["Count"] < 5].index
+    for k in empty_buckets:
+        R_ = df_avg.at[k, "Region"]
+        S_ = df_avg.at[k, "Sector"]
+        # 按 R 逻辑依次尝试填补
+        cond1 = (df_avg["Region"]==R_) & (df_avg["Sector"]==S_) & (df_avg["Rating"]==0) & (df_avg["Count"]>=5)
+        c1 = df_avg[cond1]
+        if not c1.empty:
+            df_avg.loc[k, b_cols] = c1.iloc[0][b_cols]
+            df_sd.loc[k, b_cols]  = c1.iloc[0][b_cols]
+        else:
+            cond2 = (df_avg["Region"]==R_) & (df_avg["Sector"]==0) & (df_avg["Rating"]==0) & (df_avg["Count"]>=5)
+            c2 = df_avg[cond2]
+            if not c2.empty:
+                df_avg.loc[k, b_cols] = c2.iloc[0][b_cols]
+                df_sd.loc[k, b_cols]  = c2.iloc[0][b_cols]
+            else:
+                cond3 = (df_avg["Region"]==0) & (df_avg["Sector"]==0) & (df_avg["Rating"]==0) & (df_avg["Count"]>=5)
+                c3 = df_avg[cond3]
+                if not c3.empty:
+                    df_avg.loc[k, b_cols] = c3.iloc[0][b_cols]
+                    df_sd.loc[k, b_cols]  = c3.iloc[0][b_cols]
 
-    def bucket_fill_inplace(df_main):
-        for i in range(len(df_main)):
-            if df_main.at[i,"Count"]<5:
-                newvals = fill_bucket(i, df_main)
-                if newvals is not None:
-                    df_main.iloc[i, 4:] = newvals
-
-    bucket_fill_inplace(df_avg)
-    bucket_fill_inplace(df_sd)
-
-    # 写出
+    # 写出平均值和标准差结果文件
     fn_avg = os.path.join(result_folder, f"betas_mean_lag_{lag_month}.csv")
     fn_sd  = os.path.join(result_folder, f"betas_sd_lag_{lag_month}.csv")
     df_avg.to_csv(fn_avg, index=False)
     df_sd.to_csv(fn_sd, index=False)
 
-    print(f"[calc_betas_and_results] Done. Wrote:\n {fn_all}\n {fn_avg}\n {fn_sd}")
-###############################################################################
+    print(f"Result files written: {fn_avg}, {fn_sd}")
+##############################################################################
 # 主函数: 演示如何调用上述4个函数
 ###############################################################################
 def main():
