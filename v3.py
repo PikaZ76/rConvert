@@ -338,12 +338,12 @@ def calc_betas_and_results(a0, a0_anno, i_regs, n_sec=6, lag_month=12,
 ###############################################################################
 def main():
     input_file = "data\\input_TB_2020.csv"
-    a0 = pd.read_csv(input_file)
-    a0 = a0[a0["TB"] == True].copy()
+    i_df = pd.read_csv(input_file)
+    i_df = i_df[i_df["TB"] == True].copy()
 
     n_anno = 5
-    a0_anno = a0.iloc[:, :n_anno].copy()
-    a0_ts = a0.iloc[:, n_anno:].copy()
+    i_anno_df = i_df.iloc[:, :n_anno].copy()
+    i_ts_df = i_df.iloc[:, n_anno:].copy()
 
     region_groups = [
     [1],
@@ -351,7 +351,7 @@ def main():
     [3, 5],
     [6, 7]
     ]
-    i_regs = [np.where(a0['Region'].isin(grp))[0] for grp in region_groups]
+    i_regs = [np.where(i_df['Region'].isin(grp))[0] for grp in region_groups]
 
     n_sec = 6
     # n_t = a0_ts.shape[1]
@@ -363,22 +363,22 @@ def main():
     #     n_iss_idx0[i] = col_data.notna().sum()
 
     # 计算每列的非空平均值，返回一个 Series，再转为 numpy 数组
-    idx0 = a0_ts.mean(axis=0, skipna=True).values
+    i_ts_mean_ds = i_ts_df.mean(axis=0, skipna=True).values
     # 计算每列非空值的个数，返回一个 Series，再转为整型 numpy 数组
-    n_iss_idx0 = a0_ts.notna().sum(axis=0).values.astype(int)
+    n_iss_idx0 = i_ts_df.notna().sum(axis=0).values.astype(int)
     
     os.makedirs("log", exist_ok=True)
     os.makedirs("result", exist_ok=True)
 
-    get_ZidxA(a0, a0_ts, a0_anno, i_regs, n_sec, idx0, n_iss_idx0, out_folder="log")
+    get_ZidxA(i_df, i_ts_df, i_anno_df, i_regs, n_sec, i_ts_mean_ds, n_iss_idx0, out_folder="log")
     get_ZidxBB(n_sec, lag_month=12, in_folder="log", out_folder="log")
     get_ZvB(n_sec, in_folder="log", out_folder="log")
-    get_Za(a0_ts, a0_anno, i_regs, lag_month=12, out_folder="log")
+    get_Za(i_ts_df, i_ts_df, i_regs, lag_month=12, out_folder="log")
 
     # 注意：此处 output 需要由实际回归逻辑生成
     output = pd.DataFrame()  # TODO: 替换为实际生成的 output DataFrame
 
-    calc_betas_and_results(a0, a0_anno, i_regs, n_sec=n_sec, lag_month=12,
+    calc_betas_and_results(i_df, i_anno_df, i_regs, n_sec=n_sec, lag_month=12,
                            log_folder="log", result_folder="result")
 
     print("All done.")
